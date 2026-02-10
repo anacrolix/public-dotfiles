@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Promote allowed commands from .claude/settings.local.json files
+to co-located settings.json and/or the global ~/.claude/settings.json."""
+
+import argparse
+import json
+import os
+import sys
+import tty
+import termios
+from pathlib import Path
+
+# Terminal escape codes
+CLEAR_LINE = "\033[2K"
+MOVE_UP = "\033[A"
+HIDE_CURSOR = "\033[?25l"
+SHOW_CURSOR = "\033[?25h"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+GREEN = "\033[32m"
+CYAN = "\033[36m"
+RESET = "\033[0m"
+
+
+def load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def get_allow_list(data):
+    return data.get("permissions", {}).get("allow", [])
+
+
+def set_allow_list(data, allow):
+    data.setdefault("permissions", {})["allow"] = allow
+
+
+def find_local_settings(search_dir):
+    results = []
+    for root, dirs, files in os.walk(search_dir):
+        dirs[:] = [
+            d for d in dirs
+            if d == ".claude" or not d.startswith(".")
+        ]
+        if os.path.basename(root) == ".claude" and "settings.local.json" in files:
+            results.append(Path(root) / "settings.local.json")
+    return sorted(results)
+
+
+def read_key():
+    """Read a single keypress, handling escape sequences for arrow keys."""
+    fd = sys.stdin.fileno()
+    ch = os.read(fd, 1)
+    if ch == b"\x1b":
+        seq = os.read(fd, 2)
+        if seq == b"[A":
+            return "up"
+        if seq == b"[B":
+            return "down"
+        return "escape"
+    if ch == b" ":
+        return "space"
+    if ch in (b"\r", b"\n"):
+        return "enter"
+    if ch == b"a":
+        return "a"
+    if ch == b"n":
+        return "n"
+    if ch in (b"q", b"\x03"):  # q or Ctrl-C
+        return "quit"
+    return ch.decode("utf-8", errors="replace")
+
+
+def get_terminal_height():
+    try:
+        return os.get_terminal_size().lines
+    except OSError:
+        return 24
+
+
+def render_checklist(items, selected, cursor, header, scroll_offset, visible_count):
+    """Render the checklist with a scrolling viewport."""
+    lines = []
+    lines.append(f"  {BOLD}{header}{RESET}")
+    lines.append(f"  {DIM}(space: toggle, a: all, n: none, enter: confirm, q: cancel){RESET}")
+    lines.append("")
+
+    end = min(scroll_offset + visible_count, len(items))
+
+    if scroll_offset > 0:
+        lines.append(f"  {DIM}  ... {scroll_offset} more above{RESET}")
+    for i in range(scroll_offset, end):
+        marker = f"{GREEN}\u2714{RESET}" if selected[i] else f"{DIM}\u2718{RESET}"
+        if i == cursor:
+            lines.append(f"  {CYAN}\u25b8{RESET} [{marker}] {items[i]}")
+        else:
+            lines.append(f"    [{marker}] {items[i]}")
+    remaining = len(items) - end
+    if remaining > 0:
+        lines.append(f"  {DIM}  ... {remaining} more below{RESET}")
+
+    count = sum(selected)
+    lines.append(f"\n  {DIM}{count}/{len(items)} selected{RESET}")
+    return lines
+
+
+def checklist(items, header):
+    """Interactive checklist with scrolling viewport. Returns list of selected items."""
+    if not items:
+        return []
+
+    selected = [False] * len(items)
+    cursor = 0
+    scroll_offset = 0
+
+    # Reserve lines for header(3) + possible scroll indicators(2) + status(2)
+    CHROME_LINES = 7
+    term_h = get_terminal_height()
+    visible_count = max(1, term_h - CHROME_LINES)
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        sys.stdout.write(HIDE_CURSOR)
+        sys.stdout.flush()
+
+        prev_line_count = 0
+        while True:
+            # Keep cursor within the visible window
+            if cursor < scroll_offset:
+                scroll_offset = cursor
+            elif cursor >= scroll_offset + visible_count:
+                scroll_offset = cursor - visible_count + 1
+
+            # Clear previous render
+            if prev_line_count > 0:
+                sys.stdout.write(f"{MOVE_UP}{CLEAR_LINE}" * prev_line_count)
+                sys.stdout.write("\r")
+
+            lines = render_checklist(items, selected, cursor, header, scroll_offset, visible_count)
+            output = "\r\n".join(lines)
+            sys.stdout.write(output)
+            sys.stdout.flush()
+            prev_line_count = len(lines)
+
+            key = read_key()
+            if key == "up":
+                cursor = (cursor - 1) % len(items)
+                if cursor == len(items) - 1:
+                    scroll_offset = max(0, len(items) - visible_count)
+            elif key == "down":
+                cursor = (cursor + 1) % len(items)
+                if cursor == 0:
+                    scroll_offset = 0
+            elif key == "space":
+                selected[cursor] = not selected[cursor]
+            elif key == "a":
+                for i in range(len(selected)):
+                    selected[i] = True
+            elif key == "n":
+                for i in range(len(selected)):
+                    selected[i] = False
+            elif key == "enter":
+                break
+            elif key == "quit":
+                # Clean up display before exiting
+                sys.stdout.write(f"{MOVE_UP}{CLEAR_LINE}" * prev_line_count)
+                sys.stdout.write("\r")
+                sys.stdout.write(f"  {BOLD}{header}{RESET} aborted\r\n")
+                sys.stdout.write(SHOW_CURSOR)
+                sys.stdout.flush()
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                sys.exit(130)
+
+        # Final render: just show summary
+        sys.stdout.write(f"{MOVE_UP}{CLEAR_LINE}" * prev_line_count)
+        sys.stdout.write("\r")
+        count = sum(selected)
+        sys.stdout.write(f"  {BOLD}{header}{RESET} {count}/{len(items)} selected\r\n")
+        sys.stdout.write(SHOW_CURSOR)
+        sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        sys.stdout.write(SHOW_CURSOR)
+        sys.stdout.flush()
+
+    return [item for item, sel in zip(items, selected) if sel]
+
+
+def promote_commands(source_path, target_path, target_label):
+    """Offer to promote commands from source to target interactively.
+
+    Returns the list of commands that were promoted.
+    """
+    source_data = load_json(source_path)
+    source_allow = get_allow_list(source_data)
+    if not source_allow:
+        return []
+
+    target_data = load_json(target_path)
+    target_allow = get_allow_list(target_data)
+    target_set = set(target_allow)
+
+    new_commands = [cmd for cmd in source_allow if cmd not in target_set]
+    if not new_commands:
+        return []
+
+    promoted = checklist(new_commands, f"Promote to {target_label}:")
+
+    if promoted:
+        target_allow = target_allow + promoted
+        set_allow_list(target_data, target_allow)
+        save_json(target_path, target_data)
+        print(f"  Wrote {len(promoted)} command(s) to {target_path}")
+
+    return promoted
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Promote allowed commands from .claude/settings.local.json "
+        "files to project or global settings."
+    )
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=str(Path.home()),
+        help="Directory to search (default: home directory)",
+    )
+    args = parser.parse_args()
+
+    search_dir = Path(args.directory).expanduser().resolve()
+    if not search_dir.is_dir():
+        print(f"Error: {search_dir} is not a directory", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Searching {search_dir} for .claude/settings.local.json files...")
+    local_files = find_local_settings(search_dir)
+
+    if not local_files:
+        print("No .claude/settings.local.json files found.")
+        return
+
+    print(f"Found {len(local_files)} file(s).")
+
+    global_settings_path = Path.home() / ".claude" / "settings.json"
+    global_candidates = []
+
+    for local_path in local_files:
+        claude_dir = local_path.parent
+        project_dir = claude_dir.parent
+        project_settings = claude_dir / "settings.json"
+
+        source_data = load_json(local_path)
+        source_allow = get_allow_list(source_data)
+        if not source_allow:
+            continue
+
+        existing = get_allow_list(load_json(project_settings))
+
+        print(f"\n{'=' * 60}")
+        print(f"Project: {project_dir}")
+        print(f"  Local settings:   {local_path} ({len(source_allow)} commands)")
+        print(f"  Project settings: {project_settings} ({len(existing)} commands)")
+
+        promote_commands(
+            local_path, project_settings, "project settings"
+        )
+
+        global_candidates.extend(source_allow)
+
+    # Deduplicate global candidates preserving order
+    seen = set()
+    unique_candidates = []
+    for cmd in global_candidates:
+        if cmd not in seen:
+            seen.add(cmd)
+            unique_candidates.append(cmd)
+
+    global_data = load_json(global_settings_path)
+    global_allow = get_allow_list(global_data)
+    global_set = set(global_allow)
+    global_new = [cmd for cmd in unique_candidates if cmd not in global_set]
+
+    if global_new:
+        print(f"\n{'=' * 60}")
+        print(f"Global settings: {global_settings_path} ({len(global_allow)} commands)")
+
+        promoted_global = checklist(global_new, "Promote to global settings:")
+
+        if promoted_global:
+            global_allow = global_allow + promoted_global
+            set_allow_list(global_data, global_allow)
+            save_json(global_settings_path, global_data)
+            print(f"  Wrote {len(promoted_global)} command(s) to {global_settings_path}")
+    else:
+        print("\nNo new commands to promote to global settings.")
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
