@@ -1,0 +1,171 @@
+#!/usr/bin/env fish
+
+# Removes branches (local, remote, or both) that are ancestors
+# of another branch present on the remote.
+
+argparse h/help delete 'remote=' -- $argv
+or return 1
+
+if set -q _flag_help
+    echo "Usage: "(status basename)" [--delete] [--remote NAME]"
+    echo
+    echo "Find branches whose local and/or remote copies are ancestors"
+    echo "of other remote branches, and remove them."
+    echo
+    echo "Options:"
+    echo "  --delete       Actually delete (default: dry run)"
+    echo "  --remote NAME  Remote name (default: origin)"
+    echo "  -h, --help     Show this help"
+    return 0
+end
+
+set -l remote $_flag_remote
+if not set -q _flag_remote; or test -z "$remote"
+    set remote origin
+end
+
+if not git rev-parse --is-inside-work-tree &>/dev/null
+    echo "Error: not inside a git repository." >&2
+    return 1
+end
+
+set -l current_branch (git branch --show-current 2>/dev/null)
+set -l protected main master
+
+if not set -q _flag_delete
+    echo "Fetching $remote..."
+    git fetch --prune --quiet $remote
+end
+
+# Collect remote branches: parallel arrays of names and SHAs
+set -l rnames
+set -l rshas
+for line in (git for-each-ref --format='%(refname:short) %(objectname)' "refs/remotes/$remote/")
+    set -l parts (string split ' ' -- $line)
+    set -l name (string replace "$remote/" '' -- $parts[1])
+    # Skip HEAD and bare remote name (symref artifact with no slash)
+    if test "$name" = HEAD; or not string match -q '*/*' -- $parts[1]
+        continue
+    end
+    set -a rnames $name
+    set -a rshas $parts[2]
+end
+
+# Collect local branches: parallel arrays of names and SHAs
+set -l lnames
+set -l lshas
+for line in (git for-each-ref --format='%(refname:short) %(objectname)' refs/heads/)
+    set -l parts (string split ' ' -- $line)
+    set -a lnames $parts[1]
+    set -a lshas $parts[2]
+end
+
+# Result arrays: branch names and what to delete (local+remote / remote / local)
+set -l prune_names
+set -l prune_del_remote  # "yes" or "no"
+set -l prune_del_local   # "yes" or "no"
+set -l prune_reasons
+
+# --- Check remote branches ---
+for i in (seq (count $rnames))
+    set -l name $rnames[$i]
+    if contains -- $name $protected; or test "$name" = "$current_branch"
+        continue
+    end
+
+    set -l rsha $rshas[$i]
+    for j in (seq (count $rnames))
+        if test $j -eq $i
+            continue
+        end
+        if git merge-base --is-ancestor $rsha $rshas[$j] 2>/dev/null
+            set -a prune_names $name
+            set -a prune_del_remote yes
+            set -a prune_del_local no
+            set -a prune_reasons "remote ancestor of $rnames[$j]"
+            break
+        end
+    end
+end
+
+# --- Check local branches ---
+for i in (seq (count $lnames))
+    set -l name $lnames[$i]
+    if contains -- $name $protected; or test "$name" = "$current_branch"
+        continue
+    end
+
+    set -l lsha $lshas[$i]
+    for j in (seq (count $rnames))
+        # Skip the same-named remote branch
+        if test "$rnames[$j]" = "$name"
+            continue
+        end
+        if git merge-base --is-ancestor $lsha $rshas[$j] 2>/dev/null
+            # Check if this branch already has a remote deletion entry
+            set -l idx 0
+            for k in (seq (count $prune_names))
+                if test "$prune_names[$k]" = "$name"
+                    set idx $k
+                    break
+                end
+            end
+            if test $idx -eq 0
+                set -a prune_names $name
+                set -a prune_del_remote no
+                set -a prune_del_local yes
+                set -a prune_reasons "local ancestor of $rnames[$j]"
+            else
+                set prune_del_local[$idx] yes
+                set prune_reasons[$idx] "$prune_reasons[$idx], local ancestor of $rnames[$j]"
+            end
+            break
+        end
+    end
+end
+
+if test (count $prune_names) -eq 0
+    echo "No branches to prune."
+    return 0
+end
+
+echo (count $prune_names)" branch(es) are ancestors of other remote branches:"
+echo
+for i in (seq (count $prune_names))
+    set -l scope
+    if test "$prune_del_local[$i]" = yes -a "$prune_del_remote[$i]" = yes
+        set scope "local+remote"
+    else if test "$prune_del_remote[$i]" = yes
+        set scope "remote only"
+    else
+        set scope "local only"
+    end
+    printf "  %-40s  [%s] %s\n" $prune_names[$i] $scope $prune_reasons[$i]
+end
+
+if not set -q _flag_delete
+    echo
+    echo "Re-run with --delete to remove them."
+    return 0
+end
+
+echo
+for i in (seq (count $prune_names))
+    set -l name $prune_names[$i]
+
+    if test "$prune_del_remote[$i]" = yes
+        if git push $remote --delete $name &>/dev/null
+            echo "  Deleted $remote/$name"
+        else
+            echo "  Failed to delete $remote/$name" >&2
+        end
+    end
+
+    if test "$prune_del_local[$i]" = yes
+        if git branch -D $name &>/dev/null
+            echo "  Deleted local $name"
+        else
+            echo "  Failed to delete local $name" >&2
+        end
+    end
+end
