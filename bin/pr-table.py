@@ -2,17 +2,49 @@
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
 
-USERNAME = "anacrolix"
-BRANCH_PREFIX = f"{USERNAME}/"
-MERGE_AGE_CUTOFF = timedelta(weeks=1)
+DEFAULT_MERGE_AGE_CUTOFF = timedelta(days=10)
+
+DURATION_UNITS = {
+    "s": "seconds", "sec": "seconds", "second": "seconds", "seconds": "seconds",
+    "m": "minutes", "min": "minutes", "minute": "minutes", "minutes": "minutes",
+    "h": "hours", "hr": "hours", "hour": "hours", "hours": "hours",
+    "d": "days", "day": "days", "days": "days",
+    "w": "weeks", "week": "weeks", "weeks": "weeks",
+}
+
+
+def parse_since(value):
+    """Parse a --since value as either a duration ('2w ago', '3 days') or a datetime."""
+    value = value.strip()
+    # Try "N unit [ago]" patterns
+    m = re.fullmatch(r"(\d+)\s*([a-z]+)\s*(?:ago)?", value, re.IGNORECASE)
+    if m:
+        amount = int(m.group(1))
+        unit = m.group(2).lower()
+        if unit in DURATION_UNITS:
+            return datetime.now(timezone.utc) - timedelta(**{DURATION_UNITS[unit]: amount})
+    # Try ISO datetime
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    raise argparse.ArgumentTypeError(
+        f"Cannot parse '{value}'. Use a duration like '2w ago', '3 days', or a date like '2025-01-15'."
+    )
 
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
+DIM = "\033[2m"
 BLINK_GREEN = "\033[5;32m"
 RESET = "\033[0m"
 
@@ -178,17 +210,37 @@ def main():
     global verbose
     parser = argparse.ArgumentParser(description="Show PR status table")
     parser.add_argument("-v", "--verbose", action="store_true", help="Log API calls to stderr")
+    parser.add_argument("--user", default=None, help="GitHub username (default: auto-detect via gh)")
+    parser.add_argument(
+        "--since", type=parse_since, default=None,
+        help="Show merged/closed PRs since this time. "
+             "Accepts durations like '2w ago', '3 days', '1h' or dates like '2025-01-15'.",
+    )
     args = parser.parse_args()
     verbose = args.verbose
 
+    if args.user:
+        username = args.user
+    else:
+        result = subprocess.run(
+            ["gh", "api", "user", "-q", ".login"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print("Failed to detect GitHub username. Use --user to specify.", file=sys.stderr)
+            sys.exit(1)
+        username = result.stdout.strip()
+    branch_prefix = f"{username}/"
+    print(f"User: {username}, branch prefix: {branch_prefix}", file=sys.stderr)
+
     now = datetime.now(timezone.utc)
-    cutoff = now - MERGE_AGE_CUTOFF
+    cutoff = args.since if args.since else now - DEFAULT_MERGE_AGE_CUTOFF
     cutoff_date = cutoff.strftime("%Y-%m-%d")
 
     # Split queries by state so each stays well under the 50-result cap.
     # All searches are batched into a single GraphQL request using aliases.
     search_filters = []
-    for owner_filter in [f"head:{BRANCH_PREFIX}", f"assignee:{USERNAME}"]:
+    for owner_filter in [f"head:{branch_prefix}", f"assignee:{username}"]:
         base = f"is:pr {owner_filter}"
         search_filters.append(f"{base} is:open")
         search_filters.append(f"{base} is:merged merged:>={cutoff_date}")
@@ -208,7 +260,10 @@ def main():
             rows.append(row)
 
     rows.sort(
-        key=lambda r: (0 if r["merged_dt"] else 1, r["updated_dt"]),
+        key=lambda r: (
+            0 if r["state"] in ("MERGED", "CLOSED") else 1,
+            r["updated_dt"],
+        ),
         reverse=True,
     )
 
@@ -267,15 +322,24 @@ def main():
     workflows_idx = 5
 
     print(" | ".join(pad(h, widths[i]) for i, h in enumerate(headers)))
-    print("-+-".join("-" * w for w in widths))
+    separator = "-+-".join("-" * w for w in widths)
+    print(separator)
 
+    prev_greyed = False
     for r, v, approved in zip(rows, visible, status_approved):
         url = f"https://github.com/{r['repo']}/pull/{r['number']}"
+        greyed = r["state"] in ("MERGED", "CLOSED")
+        if greyed and not prev_greyed:
+            print(separator)
+        prev_greyed = greyed
 
         cells = []
         for i in range(len(v)):
             if i == pr_idx:
-                cells.append(osc8(url, v[i]) + " " * (widths[i] - len(v[i])))
+                link = osc8(url, v[i]) + " " * (widths[i] - len(v[i]))
+                cells.append(f"{DIM}{link}{RESET}" if greyed else link)
+            elif greyed:
+                cells.append(f"{DIM}{pad(v[i], widths[i])}{RESET}")
             elif i == status_idx and not approved and r["state"] == "OPEN":
                 cells.append(f"{YELLOW}{pad(v[i], widths[i])}{RESET}")
             elif i == status_idx and approved:

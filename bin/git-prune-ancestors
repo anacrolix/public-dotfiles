@@ -32,6 +32,8 @@ end
 set -l current_branch (git branch --show-current 2>/dev/null)
 set -l protected main master
 
+echo "Remote: $remote, protected: $protected, current: $current_branch" >&2
+
 if not set -q _flag_delete
     echo "Fetching $remote..."
     git fetch --prune --quiet $remote
