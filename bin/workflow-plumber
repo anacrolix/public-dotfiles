@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone, timedelta
+
+
+def gh_api(endpoint, method="GET", paginate=False):
+    cmd = ["gh", "api", endpoint, "--method", method]
+    if paginate:
+        cmd.append("--paginate")
+    print(f"[api] {method} {endpoint}{' (paginate)' if paginate else ''}", file=sys.stderr)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"[api] error: {result.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    print(f"[api] {len(result.stdout)} bytes", file=sys.stderr)
+    if not result.stdout.strip():
+        return None
+    # --paginate concatenates JSON objects without separators; decode them sequentially
+    if paginate:
+        runs = []
+        raw = result.stdout.strip()
+        decoder = json.JSONDecoder()
+        pos = 0
+        while pos < len(raw):
+            while pos < len(raw) and raw[pos] in " \t\n\r":
+                pos += 1
+            if pos >= len(raw):
+                break
+            obj, end = decoder.raw_decode(raw, pos)
+            runs.extend(obj.get("workflow_runs", [obj]))
+            pos = end
+        return runs
+    return json.loads(result.stdout)
+
+
+def get_active_runs(repo):
+    runs = []
+    for status in ("in_progress", "queued", "waiting", "requested", "pending"):
+        data = gh_api(f"/repos/{repo}/actions/runs?status={status}&per_page=100")
+        if data:
+            runs.extend(data.get("workflow_runs", []))
+    # Deduplicate by run id
+    seen = set()
+    unique = []
+    for r in runs:
+        if r["id"] not in seen:
+            seen.add(r["id"])
+            unique.append(r)
+    return unique
+
+
+YELLOW = "\033[33m"
+GREEN = "\033[32m"
+CYAN = "\033[36m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def format_run(run):
+    status = run["status"]
+    branch = run["head_branch"]
+    name = run["name"]
+    run_id = run["id"]
+    event = run["event"]
+    elapsed = ""
+    if run.get("run_started_at"):
+        elapsed = f" (started {run['run_started_at']})"
+
+    if status == "in_progress":
+        status_str = f"{YELLOW}running{RESET}"
+    elif status in ("queued", "waiting", "requested", "pending"):
+        status_str = f"{DIM}{status}{RESET}"
+    else:
+        status_str = status
+
+    return f"  {run_id}  {status_str}  {CYAN}{branch}{RESET}  {name}  [{event}]{elapsed}"
+
+
+def cmd_list(args):
+    runs = get_active_runs(args.repo)
+    if not runs:
+        print("No running or queued workflow runs.")
+        return
+
+    # Group by branch
+    by_branch = {}
+    for r in runs:
+        by_branch.setdefault(r["head_branch"], []).append(r)
+
+    total = len(runs)
+    print(f"{BOLD}{total} pending workflow run(s) in {args.repo}{RESET}\n")
+
+    for branch in sorted(by_branch):
+        branch_runs = by_branch[branch]
+        print(f"{CYAN}{branch}{RESET} ({len(branch_runs)} run(s)):")
+        for r in sorted(branch_runs, key=lambda r: r["created_at"]):
+            print(format_run(r))
+        print()
+
+
+def cmd_cancel(args):
+    runs = get_active_runs(args.repo)
+    if not runs:
+        print("No active workflow runs to cancel.")
+        return
+
+    branches = set(args.branches)
+    to_cancel = [r for r in runs if r["head_branch"] in branches]
+
+    if not to_cancel:
+        available = sorted(set(r["head_branch"] for r in runs))
+        print("No active runs found on the specified branch(es).")
+        print(f"Active branches: {', '.join(available)}")
+        return
+
+    print(f"Cancelling {len(to_cancel)} run(s) on branch(es): {', '.join(sorted(branches))}...")
+    errors = 0
+    for r in to_cancel:
+        run_id = r["id"]
+        cancel_endpoint = f"/repos/{args.repo}/actions/runs/{run_id}/cancel"
+        print(f"[api] POST {cancel_endpoint}", file=sys.stderr)
+        result = subprocess.run(
+            ["gh", "api", cancel_endpoint, "--method", "POST"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"  Failed to cancel run {run_id} ({r['name']}): {result.stderr.strip()}", file=sys.stderr)
+            errors += 1
+        else:
+            print(f"  Cancelled run {run_id} ({r['name']}) on {r['head_branch']}")
+
+    if errors:
+        print(f"\n{errors} run(s) failed to cancel.", file=sys.stderr)
+        sys.exit(1)
+
+
+def format_duration(seconds):
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:.1f}m"
+    hours = minutes / 60
+    return f"{hours:.1f}h"
+
+
+def get_workflow_names(repo):
+    data = gh_api(f"/repos/{repo}/actions/workflows")
+    if not data:
+        return {}
+    return {w["id"]: w["name"] for w in data.get("workflows", [])}
+
+
+def cmd_stats(args):
+    since = datetime.now(timezone.utc) - timedelta(weeks=1)
+    since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = f"/repos/{args.repo}/actions/runs?status=completed&conclusion=success&created=>={since_str}&per_page=100"
+    if args.branch:
+        url += f"&branch={args.branch}"
+    runs = gh_api(url, paginate=True)
+    if not runs:
+        print("No completed workflow runs in the last week.")
+        return
+
+    workflow_names = get_workflow_names(args.repo)
+
+    # Group by workflow_id, falling back to run name
+    by_id = {}
+    for r in runs:
+        wf_id = r.get("workflow_id")
+        started = r.get("run_started_at")
+        updated = r.get("updated_at")
+        if not started or not updated:
+            continue
+        start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+        duration = (end_dt - start_dt).total_seconds()
+        if duration < 0:
+            continue
+        by_id.setdefault(wf_id, []).append(duration)
+
+    if not by_id:
+        print("No completed workflow runs with timing data in the last week.")
+        return
+
+    grand_total = 0
+    grand_count = 0
+
+    # Resolve any missing workflow names by fetching individually
+    for wf_id in by_id:
+        if wf_id not in workflow_names:
+            data = gh_api(f"/repos/{args.repo}/actions/workflows/{wf_id}")
+            if data and "name" in data:
+                workflow_names[wf_id] = data["name"]
+
+    rows = []
+    for wf_id in by_id:
+        name = workflow_names.get(wf_id, f"workflow #{wf_id}")
+        durations = by_id[wf_id]
+        total = sum(durations)
+        avg = total / len(durations)
+        grand_total += total
+        grand_count += len(durations)
+        rows.append((name, len(durations), total, avg))
+    rows.sort(key=lambda r: r[0])
+
+    # Column widths
+    name_w = max(len(r[0]) for r in rows)
+    name_w = max(name_w, len("Workflow"))
+
+    scope = f"{args.repo} branch:{args.branch}" if args.branch else args.repo
+    print(f"{BOLD}Workflow stats for {scope} (last 7 days){RESET}\n")
+    header = f"  {'Workflow':<{name_w}}  {'Runs':>5}  {'Total':>8}  {'Avg':>8}"
+    print(header)
+    print(f"  {'-' * name_w}  {'-' * 5}  {'-' * 8}  {'-' * 8}")
+    for name, count, total, avg in rows:
+        print(f"  {name:<{name_w}}  {count:>5}  {format_duration(total):>8}  {format_duration(avg):>8}")
+
+    print(f"  {'-' * name_w}  {'-' * 5}  {'-' * 8}  {'-' * 8}")
+    grand_avg = grand_total / grand_count if grand_count else 0
+    print(f"  {'Total':<{name_w}}  {grand_count:>5}  {format_duration(grand_total):>8}  {format_duration(grand_avg):>8}")
+
+
+def parse_timestamp(ts):
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def cmd_jobs(args):
+    since = datetime.now(timezone.utc) - timedelta(weeks=1)
+    since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    workflow_names = get_workflow_names(args.repo)
+    name_to_ids = {}
+    for wf_id, name in workflow_names.items():
+        name_to_ids.setdefault(name.lower(), []).append(wf_id)
+
+    # Find matching workflow IDs
+    query = args.workflow.lower()
+    matching_ids = set()
+    for name, ids in name_to_ids.items():
+        if query in name:
+            matching_ids.update(ids)
+
+    if not matching_ids:
+        print(f"No workflows matching '{args.workflow}'. Available:")
+        for name in sorted(set(workflow_names.values())):
+            print(f"  {name}")
+        return
+
+    matched_names = sorted(set(workflow_names[wf_id] for wf_id in matching_ids))
+    print(f"{BOLD}Fetching job stats for: {', '.join(matched_names)}{RESET}", file=sys.stderr)
+
+    # Fetch runs for each matching workflow
+    all_runs = []
+    for wf_id in matching_ids:
+        runs = gh_api(
+            f"/repos/{args.repo}/actions/workflows/{wf_id}/runs?status=completed&conclusion=success&created=>={since_str}&per_page=100",
+            paginate=True,
+        )
+        if runs:
+            all_runs.extend(runs)
+
+    if not all_runs:
+        print("No completed runs in the last week.")
+        return
+
+    limit = args.limit
+    if limit and len(all_runs) > limit:
+        all_runs.sort(key=lambda r: r["created_at"], reverse=True)
+        all_runs = all_runs[:limit]
+
+    # Fetch jobs for each run
+    by_job = {}
+    for i, run in enumerate(all_runs):
+        run_id = run["id"]
+        print(f"\r[jobs] fetching run {i + 1}/{len(all_runs)}...", end="", file=sys.stderr)
+        data = gh_api(f"/repos/{args.repo}/actions/runs/{run_id}/jobs")
+        if not data:
+            continue
+        for job in data.get("jobs", []):
+            name = job["name"]
+            started = job.get("started_at")
+            completed = job.get("completed_at")
+            if not started or not completed:
+                continue
+            duration = (parse_timestamp(completed) - parse_timestamp(started)).total_seconds()
+            if duration < 0:
+                continue
+            by_job.setdefault(name, []).append(duration)
+    print(file=sys.stderr)
+
+    if not by_job:
+        print("No job timing data found.")
+        return
+
+    rows = []
+    grand_total = 0
+    grand_count = 0
+    for name in sorted(by_job):
+        durations = by_job[name]
+        total = sum(durations)
+        avg = total / len(durations)
+        grand_total += total
+        grand_count += len(durations)
+        rows.append((name, len(durations), total, avg))
+
+    name_w = max(len(r[0]) for r in rows)
+    name_w = max(name_w, len("Job"))
+
+    print(f"\n{BOLD}Job stats for {', '.join(matched_names)} ({len(all_runs)} runs, last 7 days){RESET}\n")
+    print(f"  {'Job':<{name_w}}  {'Runs':>5}  {'Total':>8}  {'Avg':>8}")
+    print(f"  {'-' * name_w}  {'-' * 5}  {'-' * 8}  {'-' * 8}")
+    for name, count, total, avg in rows:
+        print(f"  {name:<{name_w}}  {count:>5}  {format_duration(total):>8}  {format_duration(avg):>8}")
+    print(f"  {'-' * name_w}  {'-' * 5}  {'-' * 8}  {'-' * 8}")
+    grand_avg = grand_total / grand_count if grand_count else 0
+    print(f"  {'Total':<{name_w}}  {grand_count:>5}  {format_duration(grand_total):>8}  {format_duration(grand_avg):>8}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="List and cancel GitHub Actions workflow runs")
+    parser.add_argument("repo", help="GitHub repo (owner/name)")
+    subparsers = parser.add_subparsers(dest="command")
+
+    subparsers.add_parser("list", help="List running and queued workflows (default)")
+
+    cancel_parser = subparsers.add_parser("cancel", help="Cancel workflow runs on specified branches")
+    cancel_parser.add_argument("branches", nargs="+", help="Branch name(s) to cancel runs for")
+
+    stats_parser = subparsers.add_parser("stats", help="Show total and average runtime for workflows in the last week")
+    stats_parser.add_argument("--branch", default=None, help="Only show stats for this branch")
+
+    jobs_parser = subparsers.add_parser("jobs", help="Show per-job stats for a workflow")
+    jobs_parser.add_argument("workflow", help="Workflow name (substring match)")
+    jobs_parser.add_argument("--limit", type=int, default=None, help="Max number of runs to fetch jobs for")
+
+    args = parser.parse_args()
+
+    if args.command == "cancel":
+        cmd_cancel(args)
+    elif args.command == "stats":
+        cmd_stats(args)
+    elif args.command == "jobs":
+        cmd_jobs(args)
+    else:
+        cmd_list(args)
+
+
+if __name__ == "__main__":
+    main()
