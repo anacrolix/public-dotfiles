@@ -63,6 +63,8 @@ repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
     exit 1
 }
 
+echo "Remote: $remote, repo: $repo" >&2
+
 # Step 1: Fetch and prune stale remote-tracking refs
 if $do_fetch; then
     echo "Fetching and pruning remote-tracking refs..."
