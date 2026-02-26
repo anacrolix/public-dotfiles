@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# git-prune-merged: Clean up local branches whose PRs were squash-merged on GitHub.
+#
+# Standard git tools (git branch --merged, git cherry) can't detect squash merges.
+# This script queries GitHub via `gh` to check PR merge status and compares local
+# branch tips against what GitHub recorded at merge time (headRefOid).
+#
+# Requirements: git, gh (authenticated), jq
+
+usage() {
+    cat <<'EOF'
+Usage: git-prune-merged [--delete] [--no-fetch]
+
+Options:
+  --delete     Delete branches classified as SAFE (implies --no-fetch)
+  --no-fetch   Skip 'git fetch --prune' at the start
+  -h, --help   Show this help
+
+Classifications:
+  SAFE      Local tip matches GitHub's headRefOid at merge time, or local is
+            strictly behind (no unpushed work). Safe to delete.
+  INSPECT   PR was merged but local branch has diverged from what GitHub merged.
+            May contain unpushed work. Review before deleting.
+  UNKNOWN   PR was merged but GitHub's headRefOid is not available locally,
+            so we can't verify. Fetch the remote and re-run, or inspect manually.
+  NO PR     No merged PR found for this branch on GitHub. Could be merged via
+            a different branch name, or never submitted.
+EOF
+}
+
+delete=false
+do_fetch=true
+
+for arg in "$@"; do
+    case "$arg" in
+        --delete)  delete=true; do_fetch=false ;;
+        --no-fetch) do_fetch=false ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown option: $arg" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+# Check prerequisites
+for cmd in git gh jq; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "Error: '$cmd' is required but not found in PATH." >&2
+        exit 1
+    fi
+done
+
+# Ensure we're in a git repo
+if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+    echo "Error: not inside a git repository." >&2
+    exit 1
+fi
+
+# Determine the GitHub remote and repo
+remote=$(git remote | head -1)
+repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
+    echo "Error: could not determine GitHub repository. Is 'gh' authenticated?" >&2
+    exit 1
+}
+
+# Step 1: Fetch and prune stale remote-tracking refs
+if $do_fetch; then
+    echo "Fetching and pruning remote-tracking refs..."
+    git fetch --prune --quiet
+    echo
+fi
+
+# Step 2: Find local branches whose upstream is gone
+gone_branches=()
+while IFS= read -r line; do
+    # Extract branch name from lines like:
+    #   + branch-name abc1234 (worktree) [origin/branch-name: gone] commit msg
+    #     branch-name abc1234 [origin/branch-name: gone] commit msg
+    branch=$(echo "$line" | sed 's/^[* +]*//' | awk '{print $1}')
+    gone_branches+=("$branch")
+done < <(git branch -vv | grep ': gone]')
+
+if [ ${#gone_branches[@]} -eq 0 ]; then
+    echo "No local branches with deleted upstream tracking branches found."
+    exit 0
+fi
+
+echo "Found ${#gone_branches[@]} branch(es) with gone upstream:"
+echo
+
+# Step 3-5: Classify each branch
+declare -A classifications
+declare -A pr_numbers
+declare -A pr_titles
+safe_branches=()
+
+for branch in "${gone_branches[@]}"; do
+    local_sha=$(git rev-parse "$branch")
+
+    # Query GitHub for merged PRs with this branch name
+    pr_json=$(gh pr list \
+        --repo "$repo" \
+        --state merged \
+        --head "$branch" \
+        --json number,title,headRefOid \
+        --limit 1 2>/dev/null) || pr_json="[]"
+
+    pr_count=$(echo "$pr_json" | jq 'length')
+
+    if [ "$pr_count" -eq 0 ]; then
+        classifications[$branch]="NO PR"
+        printf "  %-50s  NO PR\n" "$branch"
+        continue
+    fi
+
+    pr_num=$(echo "$pr_json" | jq -r '.[0].number')
+    pr_title=$(echo "$pr_json" | jq -r '.[0].title')
+    head_ref_oid=$(echo "$pr_json" | jq -r '.[0].headRefOid')
+
+    pr_numbers[$branch]="$pr_num"
+    pr_titles[$branch]="$pr_title"
+
+    if [ "$local_sha" = "$head_ref_oid" ]; then
+        classifications[$branch]="SAFE"
+        safe_branches+=("$branch")
+        printf "  %-50s  SAFE      #%-6s %s\n" "$branch" "$pr_num" "(exact match)"
+    elif git cat-file -t "$head_ref_oid" &>/dev/null; then
+        # headRefOid is available locally; check if local is ancestor (behind only)
+        if git merge-base --is-ancestor "$local_sha" "$head_ref_oid"; then
+            classifications[$branch]="SAFE"
+            safe_branches+=("$branch")
+            printf "  %-50s  SAFE      #%-6s %s\n" "$branch" "$pr_num" "(local is behind merged tip)"
+        else
+            classifications[$branch]="INSPECT"
+            printf "  %-50s  INSPECT   #%-6s %s\n" "$branch" "$pr_num" "(local has diverged)"
+        fi
+    else
+        # headRefOid not available locally - can't fully verify
+        classifications[$branch]="UNKNOWN"
+        printf "  %-50s  UNKNOWN   #%-6s %s\n" "$branch" "$pr_num" "(merged tip not available locally)"
+    fi
+done
+
+echo
+
+# Step 6: Summary and optional deletion
+safe_count=${#safe_branches[@]}
+total=${#gone_branches[@]}
+
+if [ "$safe_count" -eq 0 ]; then
+    echo "No branches classified as SAFE to delete."
+    exit 0
+fi
+
+if $delete; then
+    echo "Deleting $safe_count/$total SAFE branch(es):"
+    echo
+    for branch in "${safe_branches[@]}"; do
+        if git branch -D "$branch" 2>&1; then
+            echo "  Deleted $branch"
+        else
+            echo "  FAILED to delete $branch" >&2
+        fi
+    done
+    echo
+    echo "Run 'git worktree prune' to clean up any orphaned worktrees."
+else
+    echo "$safe_count/$total branch(es) classified as SAFE."
+    echo
+    echo "Re-run with --delete to remove SAFE branches."
+fi
