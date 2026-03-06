@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+
+import subprocess
+import shlex
+import sys
+import os
+import fnmatch
+import re
+import argparse
+
+def run(*args, **kwargs):
+	def run_args_gen():
+		for a in args:
+			if isinstance(a, list):
+				yield from a
+			else:
+				yield from shlex.split(a)
+	run_args = list(run_args_gen())
+	try:
+		return subprocess.run(run_args, check=True, text=True, capture_output=True, **kwargs).stdout
+	except subprocess.CalledProcessError as exc:
+		eprint(exc.stderr)
+		raise
+
+def strip_remote(b):
+	return b[b.index('/')+1:]
+
+def eprint(*args, **kwargs):
+	kwargs.setdefault('file', sys.stderr)
+	return print(*args, **kwargs)
+
+def parse_semver(tag):
+	"""Parse a semver tag (with optional 'v' prefix). Returns (major, minor, patch, pre) or None."""
+	m = re.match(r'^v?(\d+)\.(\d+)\.(\d+)(-(.*))?$', tag)
+	if m:
+		return int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(5) or ''
+	return None
+
+def semver_sort_key(sv):
+	major, minor, patch, pre = sv
+	# Pre-releases sort before the final release (0 < 1)
+	return (major, minor, patch, 0 if pre else 1, pre)
+
+def main():
+	parser = argparse.ArgumentParser(description='Tag downstream repo references in the current torrent repo')
+	parser.add_argument('downstream_path', help='Path to downstream git repo')
+	parser.add_argument('downstream_name', help='Name used in tag prefix (e.g. erigon)')
+	parser.add_argument('module', nargs='?', default=None,
+		help='Go module path to look up in the downstream (default: derived from current directory go.mod)')
+	parser.add_argument('--branch-pattern', default='main master release/*',
+		help='Space-separated glob patterns for remote branch short names to include (default: "main master release/*")')
+	parser.add_argument('--tag-pattern', default='v*',
+		help='Glob pattern for tags to include (default: "v*")')
+	parser.add_argument('--no-fetch', action='store_true',
+		help='Skip fetching from origin')
+	parser.add_argument('--debug', action='store_true',
+		help='Show checkouts as they occur')
+	args = parser.parse_args()
+
+	git_dir = args.downstream_path
+	downstream_name = args.downstream_name
+	module = args.module
+	if module is None:
+		module = run('go list -m').strip()
+	branch_patterns = args.branch_pattern.split()
+	tag_pattern = args.tag_pattern
+
+	def filter_branch(b):
+		return any(fnmatch.fnmatch(b, pat) for pat in branch_patterns)
+
+	def tag_filter(tag):
+		return fnmatch.fnmatch(tag, tag_pattern)
+
+	def git_in_tree(*a):
+		return run('git -C', git_dir, *a)
+
+	if not args.no_fetch:
+		eprint(f'fetching {git_dir}...')
+		git_in_tree('fetch origin')
+
+	raw_branches = git_in_tree("for-each-ref refs/remotes/origin --format='%(refname:short)'").splitlines()
+	all_tags = list(filter(tag_filter, git_in_tree("for-each-ref refs/tags --format='%(refname:short)'").splitlines()))
+
+	env = os.environb.copy()
+	env['GOWORK'] = 'off'
+
+	def fetch_module_version(treeish):
+		"""Returns (go_version, None) on success or (None, reason) on failure."""
+		if args.debug:
+			eprint(f'  checking out {treeish}')
+		git_in_tree(['checkout', treeish])
+		try:
+			run_args = list(shlex.split(f"go list -f '{{{{.Version}}}}' -m")) + [module]
+			result = subprocess.run(run_args, check=True, text=True, capture_output=True, cwd=git_dir, env=env)
+			return result.stdout.strip(), None
+		except subprocess.CalledProcessError as exc:
+			first_line = exc.stderr.strip().splitlines()[0] if exc.stderr.strip() else '(no output)'
+			return None, first_line
+
+	# Collect branch refs
+	branch_refs = []  # (nice_name, commit)
+	eprint(f'\nbranches (pattern: {args.branch_pattern}):')
+	for rtb in raw_branches:
+		try:
+			rb = strip_remote(rtb)
+		except ValueError:
+			eprint(f'  skipping {rtb}: no slash in ref name')
+			continue
+		if not filter_branch(rb):
+			continue
+		go_version, reason = fetch_module_version(rtb)
+		if go_version is None:
+			eprint(f'  {rb}: skipped: {reason}')
+		else:
+			commit = go_version.split('-')[-1]
+			eprint(f'  {rb}: {go_version}')
+			branch_refs.append((rb, commit))
+
+	# Collect all tag data first (no printing yet)
+	tag_go_version = {}  # tag -> go_version or None
+	tag_skip_reason = {}  # tag -> reason str
+	for tag in all_tags:
+		go_version, reason = fetch_module_version(tag)
+		tag_go_version[tag] = go_version
+		if reason is not None:
+			tag_skip_reason[tag] = reason
+
+	# Separate semver and non-semver tags, sort semver tags
+	semver_tags = [(tag, sv) for tag in all_tags if (sv := parse_semver(tag)) is not None]
+	non_semver_tags = [tag for tag in all_tags if parse_semver(tag) is None]
+	semver_tags.sort(key=lambda x: semver_sort_key(x[1]))
+
+	def flush_range(start, end, msg):
+		if start == end:
+			eprint(f'  {start}: {msg}')
+		else:
+			eprint(f'  [{start}, {end}]: {msg}')
+
+	# Walk semver tags in order. The first tag seen for each (commit, major, minor)
+	# key is the winner; subsequent ones are superseded.
+	to_create = []
+	for rb, commit in branch_refs:
+		to_create.append((f'downstreams/{downstream_name}/{rb}', commit))
+
+	seen_keys = {}  # (commit, major, minor) -> first (winning) tag
+	eprint(f'\ntags (pattern: {tag_pattern}):')
+	range_start = range_end = range_msg = None
+	for tag, sv in semver_tags:
+		go_version = tag_go_version[tag]
+		if go_version is None:
+			msg = f'skipped: {tag_skip_reason[tag]}'
+		else:
+			commit = go_version.split('-')[-1]
+			major, minor, _patch, _pre = sv
+			key = (commit, major, minor)
+			if key not in seen_keys:
+				seen_keys[key] = tag
+				msg = go_version
+				to_create.append((f'downstreams/{downstream_name}/{tag}', commit))
+			else:
+				msg = f'{go_version} (superseded by {seen_keys[key]})'
+		if args.debug:
+			eprint(f'  {tag}: {msg}')
+		if msg == range_msg:
+			range_end = tag
+		else:
+			if range_start is not None:
+				flush_range(range_start, range_end, range_msg)
+			range_start = range_end = tag
+			range_msg = msg
+	if range_start is not None:
+		flush_range(range_start, range_end, range_msg)
+
+	for tag in non_semver_tags:
+		go_version = tag_go_version[tag]
+		if go_version is None:
+			eprint(f'  {tag}: skipped: {tag_skip_reason[tag]}')
+		else:
+			eprint(f'  {tag}: {go_version} (non-semver)')
+			to_create.append((f'downstreams/{downstream_name}/{tag}', go_version.split('-')[-1]))
+
+	eprint('\ntags to create:')
+	for tag_name, commit in to_create:
+		eprint(f'  {tag_name} -> {commit}')
+
+	eprint()
+	for tag_name, commit in to_create:
+		run(['git', 'tag', '-f', tag_name, commit])
+		print(tag_name, '->', commit)
+
+main()
