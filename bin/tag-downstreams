@@ -7,6 +7,8 @@ import os
 import fnmatch
 import re
 import argparse
+import json
+import tempfile
 
 def run(*args, **kwargs):
 	def run_args_gen():
@@ -27,6 +29,7 @@ def strip_remote(b):
 
 def eprint(*args, **kwargs):
 	kwargs.setdefault('file', sys.stderr)
+	kwargs.setdefault('flush', True)
 	return print(*args, **kwargs)
 
 def parse_semver(tag):
@@ -35,6 +38,15 @@ def parse_semver(tag):
 	if m:
 		return int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(5) or ''
 	return None
+
+def go_version_to_git_ref(go_version):
+	"""For pseudo-versions, return the abbreviated commit hash. Otherwise return the version as a git tag ref."""
+	parts = go_version.split('-')
+	if len(parts) == 3:
+		h = parts[2]
+		if len(h) == 12 and all(c in '0123456789abcdef' for c in h):
+			return h
+	return go_version
 
 def semver_sort_key(sv):
 	major, minor, patch, pre = sv
@@ -54,7 +66,10 @@ def main():
 	parser.add_argument('--no-fetch', action='store_true',
 		help='Skip fetching from origin')
 	parser.add_argument('--debug', action='store_true',
-		help='Show checkouts as they occur')
+		help='Show go.mod reads as they occur')
+	parser.add_argument('--no-prune-stale', dest='prune_stale', action='store_false',
+		help='Keep downstream tags not emitted in this run')
+	parser.set_defaults(prune_stale=True)
 	args = parser.parse_args()
 
 	git_dir = args.downstream_path
@@ -81,21 +96,41 @@ def main():
 	raw_branches = git_in_tree("for-each-ref refs/remotes/origin --format='%(refname:short)'").splitlines()
 	all_tags = list(filter(tag_filter, git_in_tree("for-each-ref refs/tags --format='%(refname:short)'").splitlines()))
 
-	env = os.environb.copy()
-	env['GOWORK'] = 'off'
-
 	def fetch_module_version(treeish):
 		"""Returns (go_version, None) on success or (None, reason) on failure."""
 		if args.debug:
-			eprint(f'  checking out {treeish}')
-		git_in_tree(['checkout', treeish])
+			eprint(f'  reading go.mod from {treeish}')
 		try:
-			run_args = list(shlex.split(f"go list -f '{{{{.Version}}}}' -m")) + [module]
-			result = subprocess.run(run_args, check=True, text=True, capture_output=True, cwd=git_dir, env=env)
-			return result.stdout.strip(), None
+			gomod_content = subprocess.run(
+				['git', '-C', git_dir, 'show', f'{treeish}:go.mod'],
+				check=True, text=True, capture_output=True).stdout
+		except subprocess.CalledProcessError:
+			return None, 'no go.mod'
+		with tempfile.NamedTemporaryFile(mode='w', suffix='.mod', delete=False) as f:
+			f.write(gomod_content)
+			tmp_path = f.name
+		try:
+			result = subprocess.run(['go', 'mod', 'edit', '-json', tmp_path],
+				check=True, text=True, capture_output=True)
+			mod_data = json.loads(result.stdout)
 		except subprocess.CalledProcessError as exc:
 			first_line = exc.stderr.strip().splitlines()[0] if exc.stderr.strip() else '(no output)'
 			return None, first_line
+		finally:
+			os.unlink(tmp_path)
+		# Check Replace entries first
+		for rep in mod_data.get('Replace') or []:
+			if rep['Old']['Path'] == module:
+				new = rep['New']
+				if new.get('Version'):
+					return new['Version'], None
+				# Local path replace — fall through to Require
+				break
+		# Look in Require
+		for req in mod_data.get('Require') or []:
+			if req['Path'] == module:
+				return req['Version'], None
+		return None, f'{module} not in go.mod'
 
 	# Collect branch refs
 	branch_refs = []  # (nice_name, commit)
@@ -104,7 +139,8 @@ def main():
 		try:
 			rb = strip_remote(rtb)
 		except ValueError:
-			eprint(f'  skipping {rtb}: no slash in ref name')
+			if args.debug:
+				eprint(f'  skipping {rtb}: no slash in ref name')
 			continue
 		if not filter_branch(rb):
 			continue
@@ -112,23 +148,13 @@ def main():
 		if go_version is None:
 			eprint(f'  {rb}: skipped: {reason}')
 		else:
-			commit = go_version.split('-')[-1]
 			eprint(f'  {rb}: {go_version}')
-			branch_refs.append((rb, commit))
+			branch_refs.append((rb, go_version))
 
-	# Collect all tag data first (no printing yet)
-	tag_go_version = {}  # tag -> go_version or None
-	tag_skip_reason = {}  # tag -> reason str
-	for tag in all_tags:
-		go_version, reason = fetch_module_version(tag)
-		tag_go_version[tag] = go_version
-		if reason is not None:
-			tag_skip_reason[tag] = reason
-
-	# Separate semver and non-semver tags, sort semver tags
-	semver_tags = [(tag, sv) for tag in all_tags if (sv := parse_semver(tag)) is not None]
-	non_semver_tags = [tag for tag in all_tags if parse_semver(tag) is None]
-	semver_tags.sort(key=lambda x: semver_sort_key(x[1]))
+	# Only process semver tags; others (vv*, 4-component, etc.) are silently skipped
+	semver_tags = sorted(
+		[(tag, sv) for tag in all_tags if (sv := parse_semver(tag)) is not None],
+		key=lambda x: semver_sort_key(x[1]))
 
 	def flush_range(start, end, msg):
 		if start == end:
@@ -136,29 +162,23 @@ def main():
 		else:
 			eprint(f'  [{start}, {end}]: {msg}')
 
-	# Walk semver tags in order. The first tag seen for each (commit, major, minor)
-	# key is the winner; subsequent ones are superseded.
 	to_create = []
-	for rb, commit in branch_refs:
-		to_create.append((f'downstreams/{downstream_name}/{rb}', commit))
+	for rb, go_version in branch_refs:
+		to_create.append((f'downstreams/{downstream_name}/branch/{rb}', go_version, go_version_to_git_ref(go_version)))
 
-	seen_keys = {}  # (commit, major, minor) -> first (winning) tag
-	eprint(f'\ntags (pattern: {tag_pattern}):')
+	# Walk semver tags in order. Only create a downstream tag when the upstream ref changes.
+	last_semver_go_version = None
+	eprint(f'\ntags:')
 	range_start = range_end = range_msg = None
 	for tag, sv in semver_tags:
-		go_version = tag_go_version[tag]
+		go_version, reason = fetch_module_version(tag)
 		if go_version is None:
-			msg = f'skipped: {tag_skip_reason[tag]}'
+			msg = f'skipped: {reason}'
 		else:
-			commit = go_version.split('-')[-1]
-			major, minor, _patch, _pre = sv
-			key = (commit, major, minor)
-			if key not in seen_keys:
-				seen_keys[key] = tag
-				msg = go_version
-				to_create.append((f'downstreams/{downstream_name}/{tag}', commit))
-			else:
-				msg = f'{go_version} (superseded by {seen_keys[key]})'
+			msg = go_version
+			if go_version != last_semver_go_version:
+				last_semver_go_version = go_version
+				to_create.append((f'downstreams/{downstream_name}/{tag}', go_version, go_version_to_git_ref(go_version)))
 		if args.debug:
 			eprint(f'  {tag}: {msg}')
 		if msg == range_msg:
@@ -171,21 +191,43 @@ def main():
 	if range_start is not None:
 		flush_range(range_start, range_end, range_msg)
 
-	for tag in non_semver_tags:
-		go_version = tag_go_version[tag]
-		if go_version is None:
-			eprint(f'  {tag}: skipped: {tag_skip_reason[tag]}')
-		else:
-			eprint(f'  {tag}: {go_version} (non-semver)')
-			to_create.append((f'downstreams/{downstream_name}/{tag}', go_version.split('-')[-1]))
-
 	eprint('\ntags to create:')
-	for tag_name, commit in to_create:
-		eprint(f'  {tag_name} -> {commit}')
+	for tag_name, go_version, git_ref in to_create:
+		eprint(f'  {tag_name} -> {go_version}')
+
+	prefix = f'downstreams/{downstream_name}/'
+	emitted = {tag_name for tag_name, _, _ in to_create}
 
 	eprint()
-	for tag_name, commit in to_create:
-		run(['git', 'tag', '-f', tag_name, commit])
-		print(tag_name, '->', commit)
+	for tag_name, go_version, git_ref in to_create:
+		ref_desc = f' ({git_ref})' if git_ref != go_version else ''
+		existing = subprocess.run(
+			['git', 'rev-parse', f'refs/tags/{tag_name}^{{}}'],
+			text=True, capture_output=True)
+		if existing.returncode == 0:
+			existing_commit = existing.stdout.strip()
+			target = subprocess.run(
+				['git', 'rev-parse', f'{git_ref}^{{}}'],
+				text=True, capture_output=True)
+			if target.returncode != 0:
+				eprint(f'warning: {tag_name}: cannot resolve {go_version}{ref_desc}, skipping')
+				continue
+			if existing_commit == target.stdout.strip():
+				continue
+			eprint(f'error: {tag_name} already points to {existing_commit[:12]}, wanted {go_version}{ref_desc}')
+			sys.exit(1)
+		result = subprocess.run(['git', 'tag', tag_name, git_ref], text=True, capture_output=True)
+		if result.returncode != 0:
+			eprint(f'warning: {tag_name}: cannot resolve {go_version}{ref_desc}, skipping')
+		else:
+			print(tag_name, '->', go_version)
+
+	if args.prune_stale:
+		stale = [t for t in run('git tag -l').splitlines() if t.startswith(prefix) and t not in emitted]
+		for tag_name in stale:
+			commit = subprocess.run(['git', 'rev-parse', f'refs/tags/{tag_name}^{{}}'],
+				text=True, capture_output=True).stdout.strip()
+			run(['git', 'tag', '-d', tag_name])
+			print(f'pruned {tag_name} -> {commit[:12]}')
 
 main()
