@@ -1,0 +1,23 @@
+services:
+  network:
+    build: ./nolan
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - nolan
+
+  sandbox:
+    build: ./sandbox
+    network_mode: "service:network"
+    depends_on:
+      - network
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  nolan:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.69.0.0/24
