@@ -7,13 +7,47 @@ services:
       - nolan
 
   sandbox:
-    build: ./sandbox
+    build:
+      context: ./sandbox
+      args:
+        SANDBOX_UID: ${SANDBOX_UID}
     network_mode: "service:network"
     depends_on:
       - network
     restart: "no"
+    stdin_open: true
+    tty: true
+    environment:
+      - ANTHROPIC_API_KEY
+      - ANTHROPIC_BASE_URL
+      - CLAUDE_TASK
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
     security_opt:
-      - no-new-privileges:true
+      - seccomp=unconfined
+      - apparmor=unconfined
+    volumes:
+      - ${WORKSPACE}:/home/user/workspace
+      - ${HOME}/.claude.json:/home/user/.claude.json
+      - ${HOME}/.claude:/home/user/.claude
+      # GitHub access: mounting gh CLI auth so Claude can interact with GitHub.
+      # In future, consider a scoped PAT via GITHUB_TOKEN instead, to limit
+      # permissions exposed to the sandbox.
+      - ${HOME}/.config/gh:/home/user/.config/gh:ro
+      - go-mod:/home/user/go/pkg/mod
+      - cargo-registry:/home/user/.cargo/registry
+      - cargo-git:/home/user/.cargo/git
+      - pip-cache:/home/user/.cache/pip
+      - npm-cache:/home/user/.npm
+
+volumes:
+  go-mod:
+  cargo-registry:
+  cargo-git:
+  pip-cache:
+  npm-cache:
 
 networks:
   nolan:

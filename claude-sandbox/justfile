@@ -1,0 +1,27 @@
+#!/usr/bin/env just --justfile
+
+# # API key sent to the proxy. cliproxyapi doesn't enforce authentication
+# # (api-keys is empty in its config), so any non-empty value works here.
+# # Override with a real Anthropic API key if connecting directly instead.
+# export ANTHROPIC_API_KEY := env_var_or_default("ANTHROPIC_API_KEY", "local")
+
+# # Points Claude Code at a local cliproxyapi instance running on the macOS
+# # host. The proxy holds the Claude OAuth session and forwards requests.
+# # Override with https://api.anthropic.com if using a real API key directly.
+# export ANTHROPIC_BASE_URL := env_var_or_default("ANTHROPIC_BASE_URL", "http://host.docker.internal:8317")
+
+[private]
+_sandbox *args:
+    SANDBOX_UID="$(id -u)" WORKSPACE="{{invocation_directory()}}" \
+        docker compose -f '{{justfile_directory()}}/docker-compose.yml' \
+        run --rm {{args}} sandbox
+
+build:
+    SANDBOX_UID="$(id -u)" WORKSPACE=/dev/null \
+        docker compose -f '{{justfile_directory()}}/docker-compose.yml' build
+
+cli: (_sandbox)
+
+prompt p: (_sandbox "-e" ("CLAUDE_TASK=" + p))
+
+shell: (_sandbox "--entrypoint" "bash")

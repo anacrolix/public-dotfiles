@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker info:*)",
+      "Bash(curl:*)",
+      "Bash(security find-generic-password:*)",
+      "Read(//Users/anacrolix/ags/fuse/**)",
+      "Bash(just -f /Users/anacrolix/ags/public-dotfiles/claude-sandbox/justfile shell 2)",
+      "Bash(1:*)",
+      "Bash(just:*)"
+    ]
+  }
+}
