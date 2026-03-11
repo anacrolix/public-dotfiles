@@ -240,7 +240,7 @@ def main():
     # Split queries by state so each stays well under the 50-result cap.
     # All searches are batched into a single GraphQL request using aliases.
     search_filters = []
-    for owner_filter in [f"head:{branch_prefix}", f"assignee:{username}"]:
+    for owner_filter in [f"head:{branch_prefix}", f"assignee:{username}", f"author:{username}"]:
         base = f"is:pr {owner_filter}"
         search_filters.append(f"{base} is:open")
         search_filters.append(f"{base} is:merged merged:>={cutoff_date}")
