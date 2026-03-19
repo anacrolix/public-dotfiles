@@ -1,0 +1,11 @@
+#!/bin/bash
+
+set -eu
+
+for a in "$@"; do
+    pushd $a
+    url=$(git remote get-url $(git config --get branch.$(git branch --show-current).remote))
+    echo $url
+    popd
+    git submodule add $url ./$a
+done

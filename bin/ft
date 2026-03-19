@@ -1,0 +1,5 @@
+#!/bin/bash
+
+set -eux
+printf -v cmd '%q ' "$@"
+exec script -q -e -c "$cmd" /dev/null

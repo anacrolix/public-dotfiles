@@ -1,0 +1,17 @@
+#!/usr/bin/env just --justfile
+
+check-go:
+    #!/usr/bin/env bash
+    cd {{ invocation_directory() }}
+    ret=0
+    for a in $(go list -m); do
+        pkgs=$a/...
+        echo "$pkgs"
+        go test -run @ "$pkgs" > /dev/null
+        ret=$ret || $?
+    done
+    exit $ret
+
+# Build without running at all. Needs something to differentiate packages.
+check-go-build:
+	cd {{ invocation_directory() }} && go test -v -c -o /dev/null -ldflags=-s ./...

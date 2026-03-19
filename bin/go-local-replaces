@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+
+set -eu
+# set -o pipefail
+
+STASH_BASENAME=.go-local-replaces-stash
+
+cur_mod_stash_path () {
+	grealpath -m "$(go env GOMOD)/../$STASH_BASENAME"
+}
+
+save() {
+	set -o noclobber
+	list-replaces > "$(cur_mod_stash_path)"
+	cat "$(cur_mod_stash_path)"
+}
+
+forget() {
+	rm "$(cur_mod_stash_path)"
+}
+
+list_workspace_template="$(cat <<-EOF
+	{{ if .Main -}}
+		{{ .Path }} {{ .Dir }} {{ .GoMod }}
+	{{- end }}
+	EOF
+)"
+
+# Note this only lists local replaces
+list_replaces_template="$(cat <<-EOF
+	{{if .Replace }}{{if not .Replace.Version -}}
+		{{- .Path}} {{ .Dir }} {{ .GoMod }}
+	{{- end}}{{end -}}
+	EOF
+)"
+
+list_template="$list_replaces_template$list_workspace_template"
+
+list-modules() {
+	go list -f '{{printf "%#v" .}}' -m all
+}
+
+list-module() {
+	go list -f '{{printf "%#v" .}}' -m "$@"
+}
+
+# yields "$module_path $replace_dir" for other modules in this workspace
+list-workspace() {
+	local path dir gomod
+	while read path dir gomod; do
+		[ "$gomod" = "$(go env GOMOD)" ] || echo "$path" "$dir"
+	done < <(go list -f "$list_workspace_template" -m all)
+}
+
+# yields "$module_path $replace_dir" for modules with local replaces
+list-replaces() {
+	local path dir gomod
+	while read path dir gomod; do
+		echo "$path" "$dir"
+	done < <(go list -f "$list_replaces_template" -m all)
+}
+
+# yields "$module_path $replace_dir" for modules with local replaces
+list() {
+	local path dir gomod
+	while read path dir gomod; do
+		[ "$gomod" = "$(go env GOMOD)" ] || echo "$path" "$dir" "$(get-version "$dir")"
+	done < <(go list -f "$list_template" -m all)
+}
+
+list-mains() {
+	go list -f "$list_template" -m
+}
+
+
+list-versions() {
+	local mod path
+	while read mod path; do
+		echo "$mod" "$path" "$(get-version "$path")"
+	done < <(list)
+}
+
+get-long-version() {
+	git -C "$1" describe --no-match --always --abbrev=40 --dirty
+}
+
+is-dirty() {
+	git -C "$1" diff-index --quiet HEAD --
+}
+
+get-version() {
+	pushd "$1"
+	if ! git diff-index --quiet HEAD --; then
+		echo >&2 "$1 is dirty"
+	fi
+	git describe --match='' --always
+	popd
+}
+
+get() {
+	local mod path
+	while read mod path; do
+		echo "${mod}@$(get-version "$path")"
+	done < <(list) | xargs go get
+}
+
+drop-paths() {
+	for path in "$@"; do
+		go mod edit -dropreplace "$path"
+	done
+}
+
+module-dir() {
+	go list -f '{{.Dir}}' -m "$1"
+}
+
+drop-saved() {
+	paths=()
+	while read path _; do
+		paths+=("$path")
+	done < "$(cur_mod_stash_path)"
+	drop-paths "${paths[@]}"
+}
+
+resolve-all() {
+	local path
+	while read path _; do
+		resolve "$path"
+	done < <(list)
+	# go get `go list -m`/...
+	GOWORK=off go mod tidy
+}
+
+resolve() {
+	(( $# > 0 )) || { echo 'y u no specify paths' >&2; exit 1; }
+	local path
+	for path in "$@"; do
+		local md=`module-dir "$path"`
+		go_get="go get -v '${path}@$(get-version "$md")'"
+		echo "$go_get"
+		eval "$go_get" || continue
+		# drop-paths "$path"
+		GOWORK=off go mod download "$path"
+	done
+	# for path in "$@"; do drop `module-dir "$path"`; done
+}
+
+resolve-dir() {
+	local path=`dir-module-path "$1"`
+	resolve "$path"
+}
+
+pop() {
+	file="${1:-"$(cur_mod_stash_path)"}"
+	while read path dir; do
+		go mod edit -replace "${path}=${dir}"
+	done < "$file"
+	rm "$file"
+}
+
+push() {
+	save
+	drop-all
+}
+
+resolve-replaces() {
+	while read path dir; do
+		go get "${path}@$(get-version "$dir")"
+		go mod edit -dropreplace "$path"
+	done < <(list-replaces)
+}
+
+sync-replaces() {
+	syncfile=`mktemp tmp.sync.XXX`
+	list-replaces > "$syncfile"
+	trap 'pop "$syncfile"' EXIT
+	while read path dir; do
+		go mod edit -dropreplace "$path"
+		go get "${path}@$(get-version "$dir")" || true
+	done < "$syncfile"
+	go mod tidy
+}
+
+sync-workspace() {
+	while read path dir _; do
+		local package="${path}@$(get-version "$dir")"
+		cmd=(go get "$package")
+		echo "${cmd[@]}"
+		${cmd[@]} || true
+	done < <(list-workspace)
+}
+
+sync() {
+	sync-workspace
+	sync-replaces
+}
+
+_reldir() {
+	grealpath --relative-to "$(dirname $(go env GOMOD))" "$1"
+}
+
+add() {
+	dir="$(_reldir "$1")"
+	dir="$(dirname "$dir")/$(basename "$dir")"
+	go mod edit -replace "$(dir-module-path "$1")=$dir"
+}
+
+dir-module-path() {
+	local dir
+	for dir in "$@"; do
+		(cd "$dir" &&
+			local path dir mod
+			while read path dir gomod; do
+				[ "$gomod" = "$(go env GOMOD)" ] && echo "$path"
+			done < <(list-mains))
+	done
+}
+
+drop() {
+	local path="$(dir-module-path "$1")"
+	go mod edit -dropreplace "$path"
+	go mod download "$path"
+}
+
+drop-all() {
+	local paths path
+	paths=()
+	while read path _; do
+		paths+=("$path")
+	done < <(list)
+	(( ${#paths[@]} )) && drop-paths "${paths[@]}"
+}
+
+get() {
+	for dir in "$@"; do
+		go get "$(dir-module-path "$dir")@$(get-version "$dir")"
+	done
+}
+
+tidy() {
+	push
+	GOWORK=off go mod tidy
+	pop
+}
+
+pushd () {
+    command pushd "$@" > /dev/null
+}
+
+popd () {
+    command popd "$@" > /dev/null
+}
+
+typeset -f "$1" > /dev/null || { echo "no such subcommand"; exit 2; }
+"$1" "${@:2}"

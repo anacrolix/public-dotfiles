@@ -1,0 +1,6 @@
+#!/bin/bash
+set -ue
+# Note that callers should be aware of trailing slash semantics for rsync.
+exec rsync -prtCmhz \
+	-f ". $(dirname $(realpath "$0"))/../etc/rsync-src-filter" \
+	"$@"

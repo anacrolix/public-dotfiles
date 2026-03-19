@@ -1,0 +1,3 @@
+#!/bin/bash
+set -eux
+exec find . -name '*.go' -exec sed -i "s|\"$1|\"$2|g" {} \;

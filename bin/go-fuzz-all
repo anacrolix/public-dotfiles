@@ -1,0 +1,8 @@
+set -eu
+for a in `go list "$1"`; do
+	for name in `go test -list Fuzz "$a" | sed \\$d`; do
+		set -x
+		go test -fuzz "$name\$" "$a" -fuzztime 1s -run @
+		set +x
+	done
+done

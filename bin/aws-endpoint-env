@@ -1,0 +1,4 @@
+if [ -n "$AWS_ENDPOINT_URL" ]; then
+  exec aws --endpoint-url "$AWS_ENDPOINT_URL" "$@"
+fi
+exec aws "$@"

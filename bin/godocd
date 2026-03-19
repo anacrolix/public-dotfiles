@@ -1,0 +1,6 @@
+cd ~
+pkg=golang.org/x/tools/cmd/godoc 
+export GO111MODULE=off
+go get -u "$pkg"
+nohup go run "$pkg" -http=:6060 >> "${TMPDIR:-/tmp}/godocd.log" 2>&1 &
+# -analysis=type,pointer

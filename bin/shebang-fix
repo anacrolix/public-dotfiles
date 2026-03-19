@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+import argparse, sys, logging
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('file', nargs='+')
+    ns = ap.parse_args()
+    for name in ns.file:
+        with open(name, 'r+') as f:
+            try:
+                lines = list(f)
+            except UnicodeDecodeError as exc:
+                logging.warning('%s: %s', name, exc)
+                continue
+            first = lines[0]
+            if first.startswith('#! '):
+                first = '#!'+first[3:]
+            else:
+                continue
+            lines[0] = first
+            f.truncate()
+            f.writelines(lines)
+if __name__ == '__main__':
+    main()
+

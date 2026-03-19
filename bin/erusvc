@@ -1,0 +1,136 @@
+#!/bin/bash
+
+run() {
+    cd "${1:-.}"
+    mkdir -p logs
+    set -C
+    echo $$ > pid || exit
+    set +C
+    set -eu
+    exec &> logs/$$ < /dev/null
+    ln -sf logs/$$ log
+    exec ./run
+}
+rmpidfile() {
+    local pid
+    pid=`cat "$1" 2> /dev/null`
+    # [ -z "$pid" ] && return
+    if [ -n "$pid" ] && pidexists "$pid"; then
+        >&2 echo $service: $1 "$pid" still in use
+        return 1
+    fi
+    rm -f "$1"
+}
+supervise() {
+    cd "${1:-.}"
+    log 'supervisor started'
+    while ! [ -e supervisor/stop ]; do
+        log 'starting run'
+        $0 run
+        log 'run exited with status %d' "$?"
+        rmpidfile pid || break
+        [ -e supervisor/stop ] && break
+        sleep 1
+    done
+    log 'supervisor stopped'
+}
+pidexists() {
+    [ -n "$1" ] && ps -p "$1" > /dev/null
+}
+shutdown() {
+    pidexists "$1" || return
+    kill "$1" || return
+    pidexists "$1" || return
+    sleep 1
+    pidexists "$1" || return
+    kill -9 "$1"
+}
+for_service() {
+    for service in "${@:2}"; do
+        pushd "$service" > /dev/null || continue
+            "$1" "$service"
+        popd > /dev/null || exit
+    done
+}
+start() {
+    inner() {
+        rmpidfile supervisor/pid || return
+        mkdir -p supervisor
+        $0 supervise >> supervisor/log 2>&1 &
+        local spid=$!
+        disown
+        set -C
+        echo $spid > supervisor/pid || shutdown "$spid"
+    }
+    for_service inner "$@"
+}
+log() {
+    msg=`printf "$@"`
+    >&2 printf '%s %s %d: %s\n' "`date '+%Y-%m-%d %H:%M:%S%z'`" `basename "$0"` "${BASHPID:-$$}" "$msg"
+}
+killrmpidfile() {
+    [ -e "$1" ] || return
+    local pid
+    pid=`cat "$1"` || return
+    shutdown "$pid" || return
+    rmpidfile "$1"
+}
+stop() {
+    inner() {
+        touch supervisor/stop
+        killrmpidfile pid
+        sleep 1
+        killrmpidfile supervisor/pid
+        rm supervisor/stop
+    }
+    for_service inner "$@"
+}
+restart() {
+    stop "$@"
+    start "$@"
+}
+lastlogs() {
+    logs | tail
+}
+oldlogs() {
+    ls -tr logs | head -n -10
+}
+lslogs() {
+    logs
+}
+logs() {
+    ls -trhl logs
+}
+rmoldlogs() {
+    (( $# == 0 )) && set .
+    for dir in "$@"; do
+        pushd "$dir/logs" || continue
+        old=`ls -tr | head -n -10`
+        n=`echo -n "$old" | wc -l`
+        echo "deleting $n logs for $dir"
+        (( $n != 0 )) && echo "$old" | tr '\n' '\0' | xargs -0 rm --
+        popd
+    done
+}
+status() {
+    state() {
+        local pid=`cat pid 2> /dev/null`
+        if [ -n "$pid" ] && pidexists "$pid"; then
+            echo up
+            return
+        fi
+        echo down
+    }
+    inner() {
+        printf "%4s: %s\n" `state` "$1"
+    }
+    for_service inner "$@" | sort
+}
+
+if [[ `type -t "$1"` != function ]]; then
+    echo unknown function "$1"
+    exit 2
+fi
+args=("${@:2}")
+[ "${#args}" -eq 0 ] && args=(.)
+"$1" "${args[@]}"

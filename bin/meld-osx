@@ -1,0 +1,15 @@
+#!/usr/bin/python3
+
+import sys
+import subprocess
+from pathlib import Path
+
+def fix_arg(arg):
+	try:
+		return Path(arg).resolve(strict=True)
+	except FileNotFoundError:
+		return arg
+
+MELDPATH = "/Applications/Meld.app"
+
+p = subprocess.call(['open', '-W', '-a',  'Meld', '--args', *map(fix_arg, sys.argv[1:])])

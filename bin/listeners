@@ -1,0 +1,2 @@
+#!/bin/bash
+lsof -P -n -iTCP -sTCP:LISTEN -iUDP
