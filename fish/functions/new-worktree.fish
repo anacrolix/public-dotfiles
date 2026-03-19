@@ -52,13 +52,15 @@ function new-worktree
     end
     set -l dir $repo/.worktrees/$name
     git -C $repo fetch $_flag_remote
+    set -l prefixed $gh_user/$name
     if git -C $repo show-ref --verify --quiet refs/heads/$name
         git -C $repo worktree add $dir $name
     else if git -C $repo show-ref --verify --quiet refs/remotes/$_flag_remote/$name
         git -C $repo worktree add -b $name --track $dir $_flag_remote/$name
+    else if git -C $repo show-ref --verify --quiet refs/heads/$prefixed
+        git -C $repo worktree add $dir $prefixed
     else
-        set -l branch $gh_user/$name
-        git -C $repo worktree add -b $branch $dir $base
+        git -C $repo worktree add -b $prefixed $dir $base
     end
     cd $dir
     git submodule update --init
