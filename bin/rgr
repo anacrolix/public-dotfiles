@@ -1,2 +1,0 @@
-#!/bin/bash
-rg "${@:2}" --passthru "$1" | sponge "$1"

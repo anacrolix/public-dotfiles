@@ -1,3 +1,0 @@
-set -e
-cd "$(go env GOPATH)/src"
-find * -type d -name "$1"
