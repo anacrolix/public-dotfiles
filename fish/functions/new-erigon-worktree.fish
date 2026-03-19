@@ -18,6 +18,10 @@
 #   mkdir -p ~/erigon/src/erigon-git/.git/modules/node
 #   ln -sf ../interfaces ~/erigon/src/erigon-git/.git/modules/node/interfaces
 #
+# Worktrees are placed in .worktrees/ inside the repo. Add this to your global gitignore
+# (or the repo's .git/info/exclude) so git doesn't track it:
+#   echo '.worktrees/' >> ~/.gitignore
+#
 function new-erigon-worktree
     argparse 'remote=' -- $argv
     or return
