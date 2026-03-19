@@ -19,24 +19,34 @@
 #   ln -sf ../interfaces ~/erigon/src/erigon-git/.git/modules/node/interfaces
 #
 function new-erigon-worktree
-    argparse -- $argv
+    argparse 'remote=' -- $argv
     or return
+    set -q _flag_remote; or set -l _flag_remote origin
 
     if test (count $argv) -lt 1 -o (count $argv) -gt 2
-        echo "Usage: new-erigon-worktree <name> [base-branch]"
+        echo "Usage: new-erigon-worktree [--remote=<remote>] <name> [base-branch]"
         return 1
     end
-    set -l name (string replace 'anacrolix/' '' $argv[1])
-    set -l base origin/main
+
+    set -l gh_user (gh api user --jq .login 2>/dev/null)
+    if test -z "$gh_user"
+        echo "new-erigon-worktree: could not determine GitHub username via gh api"
+        return 1
+    end
+
+    set -l name (string replace "$gh_user/" '' $argv[1])
+    set -l base $_flag_remote/main
     if test (count $argv) -eq 2
         set base $argv[2]
     end
     set -l dir ~/erigon/src/erigon-worktrees/$name
-    git -C ~/erigon/src/erigon-git fetch
+    git -C ~/erigon/src/erigon-git fetch $_flag_remote
     if git -C ~/erigon/src/erigon-git show-ref --verify --quiet refs/heads/$name
         git -C ~/erigon/src/erigon-git worktree add $dir $name
+    else if git -C ~/erigon/src/erigon-git show-ref --verify --quiet refs/remotes/$_flag_remote/$name
+        git -C ~/erigon/src/erigon-git worktree add -b $name --track $dir $_flag_remote/$name
     else
-        set -l branch anacrolix/$name
+        set -l branch $gh_user/$name
         git -C ~/erigon/src/erigon-git worktree add -b $branch $dir $base
     end
     cd $dir
