@@ -22,26 +22,26 @@
 # (or the repo's .git/info/exclude) so git doesn't track it:
 #   echo '.worktrees/' >> ~/.gitignore
 #
-function new-erigon-worktree
+function new-worktree
     argparse 'remote=' -- $argv
     or return
     set -q _flag_remote; or set -l _flag_remote origin
 
     if test (count $argv) -lt 1 -o (count $argv) -gt 2
-        echo "Usage: new-erigon-worktree [--remote=<remote>] <name> [base-branch]"
+        echo "Usage: new-worktree [--remote=<remote>] <name> [base-branch]"
         return 1
     end
 
     set -l git_common (git rev-parse --git-common-dir 2>/dev/null)
     if test $status -ne 0
-        echo "new-erigon-worktree: not inside a git repository"
+        echo "new-worktree: not inside a git repository"
         return 1
     end
     set -l repo (path resolve $git_common/..)
 
     set -l gh_user (gh api user --jq .login 2>/dev/null)
     if test -z "$gh_user"
-        echo "new-erigon-worktree: could not determine GitHub username via gh api"
+        echo "new-worktree: could not determine GitHub username via gh api"
         return 1
     end
 
