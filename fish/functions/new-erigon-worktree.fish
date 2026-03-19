@@ -27,15 +27,18 @@ function new-erigon-worktree
         return 1
     end
     set -l name (string replace 'anacrolix/' '' $argv[1])
-    set -l branch anacrolix/$name
     set -l base origin/main
     if test (count $argv) -eq 2
         set base $argv[2]
     end
     set -l dir ~/erigon/src/erigon-worktrees/$name
     git -C ~/erigon/src/erigon-git fetch
-    git -C ~/erigon/src/erigon-git worktree add -b $branch $dir $base
-        or git -C ~/erigon/src/erigon-git worktree add $dir $branch
+    if git -C ~/erigon/src/erigon-git show-ref --verify --quiet refs/heads/$name
+        git -C ~/erigon/src/erigon-git worktree add $dir $name
+    else
+        set -l branch anacrolix/$name
+        git -C ~/erigon/src/erigon-git worktree add -b $branch $dir $base
+    end
     cd $dir
     git submodule update --init
     set -l common (git rev-parse --git-common-dir)
