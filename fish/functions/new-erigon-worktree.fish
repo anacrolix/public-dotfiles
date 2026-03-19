@@ -28,6 +28,13 @@ function new-erigon-worktree
         return 1
     end
 
+    set -l git_common (git rev-parse --git-common-dir 2>/dev/null)
+    if test $status -ne 0
+        echo "new-erigon-worktree: not inside a git repository"
+        return 1
+    end
+    set -l repo (path resolve $git_common/..)
+
     set -l gh_user (gh api user --jq .login 2>/dev/null)
     if test -z "$gh_user"
         echo "new-erigon-worktree: could not determine GitHub username via gh api"
@@ -39,15 +46,15 @@ function new-erigon-worktree
     if test (count $argv) -eq 2
         set base $argv[2]
     end
-    set -l dir ~/erigon/src/erigon-worktrees/$name
-    git -C ~/erigon/src/erigon-git fetch $_flag_remote
-    if git -C ~/erigon/src/erigon-git show-ref --verify --quiet refs/heads/$name
-        git -C ~/erigon/src/erigon-git worktree add $dir $name
-    else if git -C ~/erigon/src/erigon-git show-ref --verify --quiet refs/remotes/$_flag_remote/$name
-        git -C ~/erigon/src/erigon-git worktree add -b $name --track $dir $_flag_remote/$name
+    set -l dir $repo/.worktrees/$name
+    git -C $repo fetch $_flag_remote
+    if git -C $repo show-ref --verify --quiet refs/heads/$name
+        git -C $repo worktree add $dir $name
+    else if git -C $repo show-ref --verify --quiet refs/remotes/$_flag_remote/$name
+        git -C $repo worktree add -b $name --track $dir $_flag_remote/$name
     else
         set -l branch $gh_user/$name
-        git -C ~/erigon/src/erigon-git worktree add -b $branch $dir $base
+        git -C $repo worktree add -b $branch $dir $base
     end
     cd $dir
     git submodule update --init
