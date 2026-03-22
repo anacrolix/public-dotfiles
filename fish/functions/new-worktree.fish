@@ -75,12 +75,28 @@ function new-worktree
     git -C $repo worktree prune
     git -C $repo fetch $_flag_remote
     set -l prefixed $gh_user/$name
-    if test $base_explicit = false; and git -C $repo show-ref --verify --quiet refs/heads/$name
-        git -C $repo worktree add $dir $name
-    else if test $base_explicit = false; and git -C $repo show-ref --verify --quiet refs/remotes/$_flag_remote/$name
-        git -C $repo worktree add -b $name --track $dir $_flag_remote/$name
-    else if test $base_explicit = false; and git -C $repo show-ref --verify --quiet refs/heads/$prefixed
-        git -C $repo worktree add $dir $prefixed
+    set -l existing_ref ''
+    if git -C $repo show-ref --verify --quiet refs/heads/$name
+        set existing_ref refs/heads/$name
+    else if git -C $repo show-ref --verify --quiet refs/remotes/$_flag_remote/$name
+        set existing_ref refs/remotes/$_flag_remote/$name
+    else if git -C $repo show-ref --verify --quiet refs/heads/$prefixed
+        set existing_ref refs/heads/$prefixed
+    end
+    if test -n "$existing_ref"
+        if test $base_explicit = true
+            set -l existing_commit (git -C $repo rev-parse $existing_ref)
+            set -l base_commit (git -C $repo rev-parse $base)
+            if test "$existing_commit" != "$base_commit"
+                echo "new-worktree: $existing_ref exists at $existing_commit, not at $base ($base_commit)"
+                return 1
+            end
+        end
+        if string match -q 'refs/remotes/*' $existing_ref
+            git -C $repo worktree add -b $name --track $dir $existing_ref
+        else
+            git -C $repo worktree add $dir $existing_ref
+        end
     else
         git -C $repo worktree add -b $prefixed $dir $base
     end
