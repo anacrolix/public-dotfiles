@@ -1,22 +1,22 @@
 # Submodule object/LFS sharing via ref-shim (one-time setup on main repo):
 #
-#   git init --bare ~/erigon/src/erigon-git/.git/ref-shim
-#   ln -sf ../modules ~/erigon/src/erigon-git/.git/ref-shim/modules
-#   echo "$(cd ~/erigon/src/erigon-git/.git/ref-shim && pwd)/objects" \
-#       >> ~/erigon/src/erigon-git/.git/objects/info/alternates
-#   git -C ~/erigon/src/erigon-git config submodule.alternateLocation superproject
-#   git -C ~/erigon/src/erigon-git config submodule.alternateErrorStrategy info
+#   git init --bare /path/to/repo/.git/ref-shim
+#   ln -sf ../modules /path/to/repo/.git/ref-shim/modules
+#   echo "$(cd /path/to/repo/.git/ref-shim && pwd)/objects" \
+#       >> /path/to/repo/.git/objects/info/alternates
+#   git -C /path/to/repo config submodule.alternateLocation superproject
+#   git -C /path/to/repo config submodule.alternateErrorStrategy info
 #
 # How it works: git submodule update --init reads the superproject's alternates,
 # strips /objects, appends /modules/<name>/objects, and writes that path into each
 # new submodule's own alternates file. The ref-shim is a bare repo whose modules/
 # symlinks back to .git/modules/, so the resolved path is the real main-repo module.
-# This avoids cloning submodule objects per-worktree (~5.6 GB saved each time).
+# This avoids cloning submodule objects per-worktree.
 #
-# If a submodule was renamed (e.g. interfaces -> node/interfaces), create a symlink
+# If a submodule was renamed (e.g. old-name -> parent/new-name), create a symlink
 # in .git/modules/ so the name matches:
-#   mkdir -p ~/erigon/src/erigon-git/.git/modules/node
-#   ln -sf ../interfaces ~/erigon/src/erigon-git/.git/modules/node/interfaces
+#   mkdir -p /path/to/repo/.git/modules/parent
+#   ln -sf ../old-name /path/to/repo/.git/modules/parent/new-name
 #
 # Worktrees are placed in .worktrees/ inside the repo. Add this to your global gitignore
 # (or the repo's .git/info/exclude) so git doesn't track it:
