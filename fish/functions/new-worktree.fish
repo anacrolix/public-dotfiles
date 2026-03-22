@@ -23,9 +23,24 @@
 #   echo '.worktrees/' >> ~/.gitignore
 #
 function new-worktree
-    argparse 'remote=' -- $argv
+    argparse 'h/help' 'remote=' -- $argv
     or return
     set -q _flag_remote; or set -l _flag_remote origin
+
+    if set -q _flag_help
+        echo "Usage: new-worktree [--remote=<remote>] <name> [base-branch]"
+        echo ""
+        echo "Create a new git worktree under .worktrees/<name>."
+        echo ""
+        echo "Options:"
+        echo "  --remote=<remote>  Remote to fetch from and use as base (default: origin)"
+        echo "  -h, --help         Show this help message"
+        echo ""
+        echo "Arguments:"
+        echo "  <name>             Worktree/branch name (GitHub user prefix stripped if present)"
+        echo "  [base-branch]      Base branch for new worktree (default: <remote>/main)"
+        return 0
+    end
 
     if test (count $argv) -lt 1 -o (count $argv) -gt 2
         echo "Usage: new-worktree [--remote=<remote>] <name> [base-branch]"
@@ -51,6 +66,11 @@ function new-worktree
         set base $argv[2]
     end
     set -l dir $repo/.worktrees/$name
+    if test -d $dir
+        echo "new-worktree: $dir already exists on disk"
+        return 1
+    end
+    git -C $repo worktree prune
     git -C $repo fetch $_flag_remote
     set -l prefixed $gh_user/$name
     if git -C $repo show-ref --verify --quiet refs/heads/$name
