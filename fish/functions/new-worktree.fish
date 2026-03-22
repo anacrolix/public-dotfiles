@@ -61,9 +61,11 @@ function new-worktree
     end
 
     set -l name (string replace "$gh_user/" '' $argv[1])
+    set -l base_explicit false
     set -l base $_flag_remote/main
     if test (count $argv) -eq 2
         set base $argv[2]
+        set base_explicit true
     end
     set -l dir $repo/.worktrees/$name
     if test -d $dir
@@ -73,11 +75,11 @@ function new-worktree
     git -C $repo worktree prune
     git -C $repo fetch $_flag_remote
     set -l prefixed $gh_user/$name
-    if git -C $repo show-ref --verify --quiet refs/heads/$name
+    if test $base_explicit = false; and git -C $repo show-ref --verify --quiet refs/heads/$name
         git -C $repo worktree add $dir $name
-    else if git -C $repo show-ref --verify --quiet refs/remotes/$_flag_remote/$name
+    else if test $base_explicit = false; and git -C $repo show-ref --verify --quiet refs/remotes/$_flag_remote/$name
         git -C $repo worktree add -b $name --track $dir $_flag_remote/$name
-    else if git -C $repo show-ref --verify --quiet refs/heads/$prefixed
+    else if test $base_explicit = false; and git -C $repo show-ref --verify --quiet refs/heads/$prefixed
         git -C $repo worktree add $dir $prefixed
     else
         git -C $repo worktree add -b $prefixed $dir $base
